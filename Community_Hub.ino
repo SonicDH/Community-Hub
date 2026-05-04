@@ -52,7 +52,7 @@ namespace Config {
   // If you want to customize the AP info, this is the place to do it. 
   // SSID is what neighbours see in their WiFi list.
   // Leave AP_PASS empty ("") for an open network.
-  const char* AP_SSID     = "Community Board";
+  const char* AP_SSID     = "Community Hub";
   const char* AP_PASS     = "";           // "" = open network
   const int   AP_CHANNEL  = 6;
   const int   AP_MAX_CONN = 20;
@@ -116,7 +116,22 @@ void loadIdentityConfig() {
 // Shadows Config::ADMIN_KEY. Persisted to /adminkey.json.
 // Config::ADMIN_KEY is the run-time fallback if the file is absent.
 
-String adminKey = Config::ADMIN_KEY;
+String adminKey    = Config::ADMIN_KEY;
+String sessionToken    = "";  // set on successful auth, cleared on reboot
+unsigned long tokenIssuedAt = 0; // millis() when token was generated
+#define TOKEN_LIFETIME_MS  1800000UL  // 30 minutes
+
+String generateToken() {
+  String token = "";
+  for (int i = 0; i < 4; i++) {
+    uint32_t r = esp_random();
+    char chunk[9];
+    snprintf(chunk, sizeof(chunk), "%08x", r);
+    token += chunk;
+  }
+  tokenIssuedAt = millis();
+  return token;
+}
 
 void saveAdminKey() {
   DynamicJsonDocument doc(128);
@@ -952,13 +967,27 @@ checkBoardStatus();
 </html>
 )rawliteral";
 
+// Escapes a string for safe injection into a JS double-quoted string literal.
+String jsEscape(const String& s) {
+  String out;
+  out.reserve(s.length());
+  for (unsigned int i = 0; i < s.length(); i++) {
+    char c = s.charAt(i);
+    if      (c == '"')  out += "\\\"";
+    else if (c == '\\') out += "\\\\";
+    else if (c == '\n') out += "\\n";
+    else if (c == '\r') out += "\\r";
+    else                out += c;
+  }
+  return out;
+}
 
 // ===================== HTML: ADMIN PANEL =====================
-// The admin key is injected server-side so it's always in sync with Config::ADMIN_KEY.
-// The page shows a password gate first; only on success does it reveal the controls.
+// The admin key is NEVER sent to the browser.
+// The gate POSTs the key to /admin/auth which returns a session token.
+// All subsequent admin calls use token= not key=.
 
 String buildAdminPage() {
-  // We inject ADMIN_KEY into the JS so the page always matches the config.
   String page = F(R"rawliteral(
 <!DOCTYPE html>
 <html lang="en">
@@ -1164,7 +1193,7 @@ textarea.restore-area:focus { border-color: var(--accent-dark); }
 <body>
 
 <header class="site-header">
-  <div class="site-title">COMMUNITY Hub</div>
+  <div class="site-title">COMMUNITY HUB</div>
   <div class="site-sub">ADMIN PANEL</div>
 </header>
 
@@ -1351,39 +1380,46 @@ textarea.restore-area:focus { border-color: var(--accent-dark); }
 // ── Key is injected server-side ─────────────────────────────────────────────
 )rawliteral");
 
-  page += "const ADMIN_KEY = \"";
-  page += adminKey;
-  page += "\";\n";
+  // No key is ever sent to the browser.
+  // Authentication is done by POSTing to /admin/auth which returns a session token.
+  page += "let SESSION_TOKEN = '';\n";
 
-  // Pre-fill identity fields with current runtime values
+  // Pre-fill identity fields with current runtime values (safely escaped)
   page += "window.addEventListener('DOMContentLoaded', () => {\n";
-  page += "  document.getElementById('idName').value    = ";
-  page += "\"" + id_name    + "\";\n";
-  page += "  document.getElementById('idIcon').value    = ";
-  page += "\"" + id_icon    + "\";\n";
-  page += "  document.getElementById('idTagline').value = ";
-  page += "\"" + id_tagline + "\";\n";
-  page += "  document.getElementById('idRules').value   = ";
-  page += "\"" + id_rules   + "\";\n";
-  page += "  document.getElementById('idFooter').value  = ";
-  page += "\"" + id_footer  + "\";\n";
+  page += "  document.getElementById('idName').value    = \"" + jsEscape(id_name)    + "\";\n";
+  page += "  document.getElementById('idIcon').value    = \"" + jsEscape(id_icon)    + "\";\n";
+  page += "  document.getElementById('idTagline').value = \"" + jsEscape(id_tagline) + "\";\n";
+  page += "  document.getElementById('idRules').value   = \"" + jsEscape(id_rules)   + "\";\n";
+  page += "  document.getElementById('idFooter').value  = \"" + jsEscape(id_footer)  + "\";\n";
   page += "});\n";
 
   page += F(R"rawliteral(
 // ── Gate ────────────────────────────────────────────────────────────────────
 function tryLogin() {
   const val = document.getElementById('keyIn').value;
-  if (val === ADMIN_KEY) {
+  if (!val) return;
+
+  fetch('/admin/auth', {
+    method: 'POST',
+    body: JSON.stringify({ key: val })
+  })
+  .then(r => {
+    if (!r.ok) throw new Error('forbidden');
+    return r.text();
+  })
+  .then(token => {
+    SESSION_TOKEN = token;
     document.getElementById('gate').style.display  = 'none';
     document.getElementById('panel').style.display = 'block';
-    // Pre-fill the datetime picker with the current local time
     const now = new Date();
     now.setSeconds(0, 0);
     document.getElementById('timeIn').value = now.toISOString().slice(0, 16);
     loadLedValues();
-  } else {
+    loadPostList();
+  })
+  .catch(() => {
     document.getElementById('gateErr').textContent = 'Incorrect key.';
-  }
+  });
 }
 document.getElementById('keyIn').addEventListener('keydown', e => {
   if (e.key === 'Enter') tryLogin();
@@ -1391,7 +1427,21 @@ document.getElementById('keyIn').addEventListener('keydown', e => {
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 function api(path) {
-  return path + (path.includes('?') ? '&' : '?') + 'key=' + encodeURIComponent(ADMIN_KEY);
+  return path + (path.includes('?') ? '&' : '?') + 'token=' + encodeURIComponent(SESSION_TOKEN);
+}
+
+function apiFetch(url, options) {
+  return fetch(url, options).then(r => {
+    if (r.status === 403) {
+      SESSION_TOKEN = '';
+      document.getElementById('panel').style.display = 'none';
+      document.getElementById('gate').style.display  = 'block';
+      document.getElementById('gateErr').textContent = 'Session expired. Please log in again.';
+      document.getElementById('keyIn').value = '';
+      throw new Error('session expired');
+    }
+    return r;
+  });
 }
 
 function fb(id, msg) {
@@ -1406,7 +1456,7 @@ function doSetKey() {
   const c = document.getElementById('newKeyConfirm').value;
   if (n.length < 4)  { fb('keyFb', '✗ Key must be at least 4 characters'); return; }
   if (n !== c)       { fb('keyFb', '✗ Keys do not match'); return; }
-  fetch(api('/admin/setkey') + '&newkey=' + encodeURIComponent(n))
+  apiFetch(api('/admin/setkey') + '&newkey=' + encodeURIComponent(n))
     .then(r => r.text())
     .then(msg => {
       fb('keyFb', '✓ ' + msg);
@@ -1425,7 +1475,7 @@ function doIdentity() {
     rules:   document.getElementById('idRules').value.trim(),
     footer:  document.getElementById('idFooter').value.trim()
   });
-  fetch(api('/admin/identity/set') + '&' + params.toString())
+  apiFetch(api('/admin/identity/set') + '&' + params.toString())
     .then(r => r.text())
     .then(msg => fb('idFb', '✓ ' + msg))
     .catch(() => fb('idFb', '✗ Request failed'));
@@ -1438,7 +1488,7 @@ function doTime() {
   const [date, time] = raw.split('T');
   const [y, m, d]   = date.split('-');
   const formatted   = d + m + y + '-' + time.replace(':', '');
-  fetch(api('/admin/time') + '&time=' + formatted)
+  apiFetch(api('/admin/time') + '&time=' + formatted)
     .then(r => r.text())
     .then(msg => fb('timeFb', '✓ ' + msg))
     .catch(() => fb('timeFb', '✗ Request failed'));
@@ -1446,7 +1496,7 @@ function doTime() {
 
 // ── LED ──────────────────────────────────────────────────────────────────────
 function loadLedValues() {
-  fetch(api('/admin/led/get'))
+  apiFetch(api('/admin/led/get'))
     .then(r => r.json())
     .then(d => {
       document.getElementById('ledDayBr').value              = d.day_br;
@@ -1482,7 +1532,7 @@ function doLed() {
     pulse:    document.getElementById('ledPulse').checked    ? '1' : '0',
     activity: document.getElementById('ledActivity').checked ? '1' : '0'
   });
-  fetch(api('/admin/led/set') + '&' + params.toString())
+  apiFetch(api('/admin/led/set') + '&' + params.toString())
     .then(r => r.text())
     .then(msg => fb('ledFb', '✓ ' + msg))
     .catch(() => fb('ledFb', '✗ Request failed'));
@@ -1490,12 +1540,12 @@ function doLed() {
 
 // ── Board actions ─────────────────────────────────────────────────────────────
 async function doAction(path, fbId, isDownload) {
-  const r   = await fetch(api(path));
+  const r   = await apiFetch(api(path));
   const txt = await r.text();
   if (isDownload) {
     const a = document.createElement('a');
     a.href     = 'data:application/json,' + encodeURIComponent(txt);
-    a.download = 'community_Hub_backup.json';
+    a.download = 'community_hub_backup.json';
     a.click();
     fb(fbId, '✓ Download started');
   } else {
@@ -1505,7 +1555,7 @@ async function doAction(path, fbId, isDownload) {
 
 function confirmClear() {
   if (!confirm('Delete ALL posts? This cannot be undone.')) return;
-  fetch(api('/admin/clear'))
+  apiFetch(api('/admin/clear'))
     .then(r => r.text())
     .then(msg => fb('backupFb', '✓ ' + msg))
     .catch(() => fb('backupFb', '✗ Failed'));
@@ -1551,7 +1601,7 @@ async function loadPostList() {
 
 async function deletePost(id) {
   if (!confirm('Delete this post?')) return;
-  const r = await fetch(api('/admin/delete/post') + '&id=' + id);
+  const r = await apiFetch(api('/admin/delete/post') + '&id=' + id);
   if (r.ok) {
     const row = document.getElementById('pr-' + id);
     if (row) row.remove();
@@ -1613,7 +1663,7 @@ function doOTA() {
 function doRestore() {
   const body = document.getElementById('restoreIn').value.trim();
   if (!body) return;
-  fetch(api('/admin/restore'), { method: 'POST', body })
+  apiFetch(api('/admin/restore'), { method: 'POST', body })
     .then(r => r.text())
     .then(msg => fb('restoreFb', '✓ ' + msg))
     .catch(() => fb('restoreFb', '✗ Failed'));
@@ -1632,7 +1682,10 @@ DNSServer dnsServer;
 WebServer server(80);
 
 bool checkKey() { //WOTS DA PASSWARD?
-  return server.hasArg("key") && server.arg("key") == adminKey;
+  if (sessionToken.length() == 0)                      return false;
+  if (millis() - tokenIssuedAt > TOKEN_LIFETIME_MS)    return false;
+  if (!server.hasArg("token"))                         return false;
+  return server.arg("token") == sessionToken;
 }
 
 // Strip angle brackets and trim whitespace to prevent HTML injection.
@@ -1662,6 +1715,23 @@ void handleRoot() {
 
 void handleAdmin() {
   server.send(200, "text/html; charset=utf-8", buildAdminPage());
+}
+
+void handleAdminAuth() {
+  // Key submitted via POST body as JSON: {"key":"..."}
+  // Never echoed back — only a token is returned on success.
+  DynamicJsonDocument doc(256);
+  if (deserializeJson(doc, server.arg("plain"))) {
+    server.send(400, "text/plain", "bad request");
+    return;
+  }
+  String submitted = doc["key"] | "";
+  if (submitted == adminKey) {
+    sessionToken = generateToken();
+    server.send(200, "text/plain", sessionToken);
+  } else {
+    server.send(403, "text/plain", "forbidden");
+  }
 }
 
 void handleInfo() {
@@ -1943,6 +2013,7 @@ void setup() {
   // ── Routes ──
   server.on("/",                   handleRoot);
   server.on("/admin",              handleAdmin);
+  server.on("/admin/auth", HTTP_POST, handleAdminAuth);
   server.on("/info",               handleInfo);
   server.on("/messages",           handleMessages);
   server.on("/post",   HTTP_POST,  handlePost);
